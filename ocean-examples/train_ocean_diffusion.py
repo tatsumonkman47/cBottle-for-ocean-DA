@@ -204,11 +204,11 @@ TIME_LENGTH = 5
 # upsample_temporal_attention: if True, every upsampling block in the
 #   decoder includes temporal attention (more expensive).
 TEMPORAL_ATTN_RESOLUTIONS = [16, 8]
-DECODER_START_TEMPORAL_ATTN = True
+DECODER_START_TEMPORAL_ATTN = False
 UPSAMPLE_TEMPORAL_ATTN = False
 
 # Training hyper-parameters
-BATCH_SIZE = 56
+BATCH_SIZE = 80
 LR = 2e-4
 NUM_STEPS = 2000000
 LOG_EVERY = 50
@@ -790,8 +790,10 @@ def train():
         train_dataset,
         batch_size=cfg.batch_size,
         sampler=InfiniteSequentialSampler(train_dataset),
-        num_workers=2,
+        num_workers=8,
         pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
     train_iter = iter(train_loader)
 
@@ -800,7 +802,9 @@ def train():
     ema_net = copy.deepcopy(net).eval().requires_grad_(False)
 
     if rank == 0:
-        n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        n_params = sum(p.numel() for p in (
+            net._orig_mod.parameters() if hasattr(net, "_orig_mod") else net.parameters()
+        ) if p.requires_grad)
         print(f"Trainable parameters: {n_params:,}")
         if use_wandb:
             wandb.config.update({"trainable_params": n_params})
@@ -808,6 +812,13 @@ def train():
     # ── Optimizer & Loss ──
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr)
     loss_fn = EDMLoss(distribution="log_uniform")
+
+    # ── Mixed precision (bf16 on L40S / A100; fp16 fallback) ──
+    use_amp = torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+    if rank == 0:
+        print(f"[INFO] AMP: {use_amp}, dtype: {amp_dtype}")
 
     # ── Training ──
     net.train()
@@ -851,12 +862,14 @@ def train():
                 day_of_year=day_of_year,
             )
 
-        loss_output = loss_fn(eval_net, images=target)
-        loss_val = loss_output.total.mean()
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            loss_output = loss_fn(eval_net, images=target)
+            loss_val = loss_output.total.mean()
 
         optimizer.zero_grad(set_to_none=True)
-        loss_val.backward()
-        optimizer.step()
+        scaler.scale(loss_val).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # EMA update
         with torch.no_grad():
