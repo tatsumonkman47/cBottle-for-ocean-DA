@@ -160,7 +160,8 @@ CONDITION_CHANNELS = 2
 # in a frame) so the network learns "this frame is 3 hours old" vs "12 hours".
 #
 # Set to 0 to disable.
-TEMPORAL_OFFSET_CHANNELS = 4  # sin/cos pair × 2 frequencies
+# TEMPORAL_OFFSET_CHANNELS = 4  # sin/cos pair × 2 frequencies
+TEMPORAL_OFFSET_CHANNELS = 0  # disabled — all samples have uniform temporal spacing
 
 # Total condition channels seen by the UNet (spatial + temporal offsets)
 TOTAL_CONDITION_CHANNELS = CONDITION_CHANNELS + TEMPORAL_OFFSET_CHANNELS
@@ -207,9 +208,9 @@ DECODER_START_TEMPORAL_ATTN = True
 UPSAMPLE_TEMPORAL_ATTN = False
 
 # Training hyper-parameters
-BATCH_SIZE = 24
+BATCH_SIZE = 56
 LR = 2e-4
-NUM_STEPS = 2000
+NUM_STEPS = 2000000
 LOG_EVERY = 50
 EMA_DECAY = 0.999
 
@@ -220,14 +221,23 @@ MODEL_CHANNELS = 64  # keep small for a demo; increase for real training
 WANDB_PROJECT = "ocean-diffusion"
 WANDB_ENABLED = True  # set False to disable
 
+# ── Calendar conditioning ────────────────────────────────────────────────
+# cBottle's SongUNet has a built-in CalendarEmbedding that converts
+# second_of_day and day_of_year into learned sinusoidal features and
+# concatenates them as extra input channels.  Set > 0 to enable.
+# Typical values: 4–16.  Each of second_of_day and day_of_year produces
+# calendar_embed_channels/2 channels, so the total extra input channels
+# added to the UNet = calendar_embed_channels.
+CALENDAR_EMBED_CHANNELS = 8
+
 # ── Real data (llc4320) ──────────────────────────────────────────────────
 # Set USE_REAL_DATA=True to swap the dummy OceanDataset for the llc4320
 # adapter.  The fields below mirror the constructor args of llc4320_dataset
 # and must be configured for your filesystem layout.
 USE_REAL_DATA = True
 DATA_DIR = "/scratch/tm3076/greene_vast/pytorch_learning_tiles"                         # root of llc4320 zarr / npy tiles
-PATCH_COORDS_PATH = f"{DATA_DIR}/zarred_UVSST_x_y_coordinates_noland_nonan.npy"                # .npy with (N_patches, 3) coords
-MID_TIMESTEP = 100                    # central timestep index
+PATCH_COORDS_PATH = f"{DATA_DIR}/FULL_PACIFIC_coords.npy"                # .npy with (N_patches, 3) coords
+MID_TIMESTEP = 100                    # central timestep index (ignored when use_concat_time=True)
 INFIELDS  = ["FULL_PACIFIC_zarr_llc4320_SSH_minus_300km_filtered_fullt", "FULL_PACIFIC_zarr_llc4320_SST_tiles_4km_unfiltered_fullt"]  # input variable zarr directory names
 OUTFIELDS = ["FULL_PACIFIC_zarr_llc4320_SSH_minus_300km_filtered_fullt", "FULL_PACIFIC_zarr_llc4320_SST_tiles_4km_unfiltered_fullt"]  # output (target) variable names
 IN_MASK_LIST  = ["None", "None"]                 # mask key per input field
@@ -239,6 +249,18 @@ LLC_N = 128                           # spatial tile size (pixels)
 LLC_L_X = 512e3                       # tile extent in metres (x)
 LLC_L_Y = 512e3                       # tile extent in metres (y)
 LLC_DTIME = 12                        # temporal stride (hours)
+
+# ── Temporal coverage via ConcatDataset ──────────────────────────────────
+# Like train_diff_CLEAN.py: create one llc4320_dataset per mid_timestep and
+# concatenate them so the model sees data from the full temporal range.
+# Each sub-dataset also has randomize_time=True for ±12h local jitter.
+# Time range is in *hourly* timestep indices (0..9029 for llc4320).
+# With dtime=12 and N_t=5, the half-window is 12*2=24, so valid mid_t is
+# [24, 9005].  We sample every TIME_RANGE_STEP hours.
+USE_CONCAT_TIME = True
+TIME_RANGE_START = 48       # first mid_timestep
+TIME_RANGE_END = 9000       # last mid_timestep (exclusive)
+TIME_RANGE_STEP = 80       # step between mid_timesteps (~5 days)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -267,7 +289,7 @@ class Config:
     num_channels: int = NUM_CHANNELS
     condition_channels: int = CONDITION_CHANNELS
     temporal_offset_channels: int = TEMPORAL_OFFSET_CHANNELS
-    # NOTE: total_condition_channels is derived — see __post_init__
+    #total_condition_channels: int = CONDITION_CHANNELS + TEMPORAL_OFFSET_CHANNELS
 
     # ── Label / scalar conditioning ──
     label_dim: int = LABEL_DIM
@@ -288,6 +310,7 @@ class Config:
 
     # ── Model ──
     model_channels: int = MODEL_CHANNELS
+    calendar_embed_channels: int = CALENDAR_EMBED_CHANNELS
 
     # ── Wandb ──
     wandb_project: str = WANDB_PROJECT
@@ -310,10 +333,11 @@ class Config:
     llc_l_y: float = LLC_L_Y
     llc_dtime: int = LLC_DTIME
 
-    @property
-    def total_condition_channels(self) -> int:
-        return self.condition_channels + self.temporal_offset_channels
-
+    # ── Temporal coverage via ConcatDataset ──
+    use_concat_time: bool = USE_CONCAT_TIME
+    time_range_start: int = TIME_RANGE_START
+    time_range_end: int = TIME_RANGE_END
+    time_range_step: int = TIME_RANGE_STEP
 
 # Build the config: structured defaults + CLI overrides
 # e.g.  python train_ocean_diffusion.py H=128 lr=1e-4 wandb_enabled=false
@@ -468,12 +492,11 @@ class LLC4320Adapter(torch.utils.data.Dataset):
                 "is on sys.path (see the import block at the top of this script)."
             )
 
-        patch_coords = np.load(cfg.patch_coords_path)
+        patch_coords = np.load(cfg.patch_coords_path)[:-7,:]
         standards = dict(cfg.llc_standards) if cfg.llc_standards else None
 
-        self._ds = llc4320_dataset(
+        common_kwargs = dict(
             data_dir=cfg.data_dir,
-            mid_timestep=cfg.mid_timestep,
             N_t=cfg.time_length,
             patch_coords=patch_coords,
             infields=list(cfg.infields),
@@ -489,7 +512,25 @@ class LLC4320Adapter(torch.utils.data.Dataset):
             squeeze=False,
             return_masks=True,
             dtime=cfg.llc_dtime,
+            randomize_time=True,
+            time_jitter_hours=cfg.llc_dtime,  # ±dtime hours jitter
         )
+
+        if cfg.use_concat_time:
+            # Create one sub-dataset per mid_timestep, concatenate for full
+            # temporal coverage — same approach as train_diff_CLEAN.py.
+            time_range = range(cfg.time_range_start, cfg.time_range_end, cfg.time_range_step)
+            sub_datasets = [
+                llc4320_dataset(mid_timestep=mid_t, **common_kwargs)
+                for mid_t in time_range
+            ]
+            self._ds = torch.utils.data.ConcatDataset(sub_datasets)
+            # Grab one sub-dataset for metadata
+            self._representative_ds = sub_datasets[0]
+        else:
+            self._ds = llc4320_dataset(mid_timestep=cfg.mid_timestep, **common_kwargs)
+            self._representative_ds = self._ds
+
         self.cfg = cfg
 
         # The number of input-field channels (each field × mask = 2 per field)
@@ -510,9 +551,14 @@ class LLC4320Adapter(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         c = self.cfg
-        # llc4320_dataset with return_masks=True → (invar, outvar, inmask, outmask)
+        # llc4320_dataset with return_masks=True returns:
+        #   (invar, outvar, inmask, outmask, time_coords)
+        # where time_coords is a dict with "second_of_day" and "day_of_year"
         #   each shaped (N_t, C_fields, N, N)
-        invar, outvar, inmask, outmask = self._ds[idx]
+        raw = self._ds[idx]
+        # The last element is always the time_coords dict
+        time_coords = raw[-1]
+        invar, outvar, inmask, outmask = raw[0], raw[1], raw[2], raw[3]
 
         # ── target: outvar  (T, C, H, W) → (C, T, H*W) ──
         T, C_out, Hh, Ww = outvar.shape
@@ -540,10 +586,21 @@ class LLC4320Adapter(torch.utils.data.Dataset):
                 time_enc.unsqueeze(-1).expand(-1, T, Hh * Ww)
             )
 
+        # ── Calendar conditioning ──
+        # Convert UTC second_of_day to local solar time using the tile's
+        # central longitude, matching what CalendarEmbedding would compute:
+        #   local_time = (second_of_day + lon * 86400 / 360) % 86400
+        # We do this here so the model's CalendarEmbedding (with lon=0)
+        # receives already-local times and the per-tile geography is encoded.
+        second_of_day = time_coords["second_of_day"]        # (T,)
+        day_of_year   = time_coords["day_of_year"]          # (T,)
+        central_lon   = time_coords["central_lon"]           # scalar
+        local_second  = (second_of_day + central_lon * 86400.0 / 360.0) % 86400.0
+
         sample: dict = {
             "target": target,
-            "second_of_day": torch.zeros(T),
-            "day_of_year": torch.zeros(T),
+            "second_of_day": local_second,   # (T,) local solar time
+            "day_of_year": day_of_year,      # (T,) real calendar
         }
 
         if cond_parts:
@@ -605,10 +662,20 @@ def build_model(cfg: Config, device: torch.device) -> torch.nn.Module:
     """
     domain = Plane(nx=cfg.W, ny=cfg.H)
 
+    # For CalendarEmbedding on a Plane domain we need an explicit lon tensor.
+    # Use a placeholder (0°) here — the actual per-tile central longitude is
+    # irrelevant at model-construction time because CalendarEmbedding only
+    # uses lon to compute local solar time, and the lon buffer is fixed.
+    # We set it to 0° so the embedding learns UTC-relative time; the real
+    # per-tile longitude will shift second_of_day to local time in the
+    # dataset adapter instead (TODO for future work).
+    # Shape must be (H*W,) — one value per spatial pixel.
+    calendar_lon = torch.zeros(cfg.H * cfg.W) if cfg.calendar_embed_channels > 0 else None
+
     architecture = SongUNet(
         domain=domain,
         # in_channels = target channels + all condition channels (channel-concat)
-        in_channels=cfg.num_channels + cfg.total_condition_channels,
+        in_channels=cfg.num_channels + cfg.condition_channels + cfg.temporal_offset_channels,
         out_channels=cfg.num_channels,
         label_dim=cfg.label_dim,
         label_dropout=cfg.label_dropout,
@@ -620,8 +687,11 @@ def build_model(cfg: Config, device: torch.device) -> torch.nn.Module:
         time_length=cfg.time_length,
         # --- key setting for standard grids ---
         mixing_type="spatial",
-        # No HEALPix calendar embedding for plain grids
-        calendar_embed_channels=0,
+        # Calendar embedding: converts second_of_day + day_of_year into
+        # learned sinusoidal channels that are concatenated to the input.
+        # Set > 0 to condition on time-of-day and season.
+        calendar_embed_channels=cfg.calendar_embed_channels,
+        calendar_lon=calendar_lon,
         # --- temporal attention ---
         temporal_attention_resolutions=cfg.temporal_attn_resolutions if cfg.time_length > 1 else None,
         decoder_start_with_temporal_attention=cfg.decoder_start_temporal_attn and cfg.time_length > 1,
@@ -634,7 +704,7 @@ def build_model(cfg: Config, device: torch.device) -> torch.nn.Module:
         img_channels=cfg.num_channels,
         time_length=cfg.time_length,
         label_dim=cfg.label_dim,
-        condition_channels=cfg.total_condition_channels,
+        condition_channels=cfg.condition_channels + cfg.temporal_offset_channels,
     )
 
     return net.to(device)
@@ -659,8 +729,8 @@ def train():
         base_output_dir = None
         checkpoints_dir = None
     # Broadcast output dirs to all ranks
-    base_output_dir = cbottle.distributed.broadcast_object(base_output_dir)
-    checkpoints_dir = cbottle.distributed.broadcast_object(checkpoints_dir)
+    #base_output_dir = cbottle.distributed.broadcast_object(base_output_dir)
+    #checkpoints_dir = cbottle.distributed.broadcast_object(checkpoints_dir)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank % torch.cuda.device_count())
         device = torch.device("cuda", rank % torch.cuda.device_count())
@@ -668,22 +738,34 @@ def train():
     # ── Wandb init (rank 0 only) ──
     use_wandb = cfg.wandb_enabled and wandb is not None and rank == 0
     if use_wandb:
-        wandb.init(
-            project=cfg.wandb_project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            tags=["ocean", "diffusion", "cbottle"],
-        )
+        try:
+            wandb.init(
+                project=cfg.wandb_project,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                tags=["ocean", "diffusion", "cbottle"],
+            )
+        except wandb.errors.CommError as e:
+            print(f"[WARN] wandb init failed ({e}), continuing without wandb")
+            use_wandb = False
 
     if rank == 0:
         print(f"Device: {device}")
         print(f"Grid: {cfg.H}x{cfg.W}, Channels: {cfg.num_channels}, Time: {cfg.time_length}")
-        print(f"Condition channels: {cfg.condition_channels} (+ {cfg.temporal_offset_channels} temporal = {cfg.total_condition_channels} total)")
+        print(f"Condition channels: {cfg.condition_channels} (+ {cfg.temporal_offset_channels} temporal = {cfg.condition_channels + cfg.temporal_offset_channels} total)")
         print(f"Label dim: {cfg.label_dim}, Label dropout: {cfg.label_dropout}")
         print(f"Model channels: {cfg.model_channels}, Batch size: {cfg.batch_size}")
+        print(f"Calendar embed channels: {cfg.calendar_embed_channels}")
         print(f"Wandb: {'enabled' if use_wandb else 'disabled'}")
 
     # ── Dataset & DataLoader ──
     train_dataset = build_dataset(cfg, split="train")
+
+    if rank == 0:
+        if cfg.use_concat_time:
+            n_timesteps = len(range(cfg.time_range_start, cfg.time_range_end, cfg.time_range_step))
+            print(f"ConcatDataset: {n_timesteps} timesteps × {len(np.load(cfg.patch_coords_path))} patches = {len(train_dataset)} samples")
+        else:
+            print(f"Dataset: {len(train_dataset)} samples")
 
     # When using llc4320 real data the condition channel count is determined
     # by the dataset (2 × n_input_fields + temporal_offset_channels) and the
@@ -695,12 +777,11 @@ def train():
         # so condition_channels from data = 0.  Otherwise 2 × n_input_fields.
         all_masks_none = all(m.lower() == "none" for m in cfg.in_mask_list)
         data_cond_ch = 0 if all_masks_none else train_dataset._cond_channels
-        n_cond = data_cond_ch + cfg.temporal_offset_channels
         if n_out != cfg.num_channels:
             if rank == 0:
                 print(f"[auto] Overriding num_channels: {cfg.num_channels} → {n_out} (from outfields)")
             cfg.num_channels = n_out  # type: ignore[attr-defined]
-        if n_cond != cfg.total_condition_channels:
+        if data_cond_ch != cfg.condition_channels:
             if rank == 0:
                 print(f"[auto] Overriding condition_channels: {cfg.condition_channels} → {data_cond_ch} (from infields)")
             cfg.condition_channels = data_cond_ch  # type: ignore[attr-defined]
@@ -750,6 +831,14 @@ def train():
         if condition is not None:
             condition = condition.to(device)          # (B, C_cond, T, H*W)
 
+        # ── Calendar conditioning ──
+        second_of_day = batch.get("second_of_day")
+        day_of_year = batch.get("day_of_year")
+        if second_of_day is not None:
+            second_of_day = second_of_day.to(device)  # (B, T)
+        if day_of_year is not None:
+            day_of_year = day_of_year.to(device)      # (B, T)
+
         # EDMLoss expects a callable  net(images, sigma) -> Output
         # We curry the extra args (class_labels, condition) following the same
         # pattern used in cbottle's train_coarse.py  (_curry_net).
@@ -758,6 +847,8 @@ def train():
                 images, sigma,
                 class_labels=class_labels,
                 condition=condition,
+                second_of_day=second_of_day,
+                day_of_year=day_of_year,
             )
 
         loss_output = loss_fn(eval_net, images=target)

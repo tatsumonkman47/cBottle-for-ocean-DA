@@ -1065,6 +1065,7 @@ class SongUNet(torch.nn.Module):
         add_spatial_embedding: bool = False,
         calendar_embed_channels: int = 0,  # embedding dimension for year fraction and second fraction
         calendar_include_legacy_bug: bool = False,
+        calendar_lon: Optional[torch.Tensor] = None,  # explicit lon for non-HEALPix domains
         decoder_start_with_temporal_attention: bool = False,
         upsample_temporal_attention: bool = False,
         channels_per_head: int = -1,  # uses all heads if -1, otherwise uses this many per head
@@ -1116,9 +1117,18 @@ class SongUNet(torch.nn.Module):
             block_kwargs.update(channels_per_head=channels_per_head)
 
         if calendar_embed_channels:
-            # needs healpix
+            if calendar_lon is not None:
+                # Use explicitly provided longitude tensor (e.g. for Plane domains)
+                _lon = (
+                    calendar_lon
+                    if isinstance(calendar_lon, torch.Tensor)
+                    else torch.from_numpy(np.asarray(calendar_lon)).float()
+                )
+            else:
+                # Fall back to HEALPix grid longitude
+                _lon = torch.from_numpy(self.grid.lon).float()
             self.embed_calendar = CalendarEmbedding(
-                torch.from_numpy(self.grid.lon).float(),
+                _lon,
                 calendar_embed_channels,
                 include_legacy_bug=calendar_include_legacy_bug,
             )
